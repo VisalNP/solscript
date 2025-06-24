@@ -1,0 +1,119 @@
+:root {
+    --bg-main: #150029;
+    --bg-card: #18002f;
+    --bg-zone-card: #18002f;
+    --border-color: #43464a00;
+    --text-primary: #ffffff;
+    --text-muted: #99aab5;
+    --green: #00d057;
+    --red: #ff634e;
+    --blue: #5e00b5;
+    --gold: #FBC02D;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background-color: var(--bg-main);
+    color: var(--text-primary);
+    margin: 0;
+    padding: 20px;
+    -webkit-font-smoothing: antialiased;
+    overflow-y: scroll;
+}
+
+.container { max-width: 1200px; margin: 0 auto; }
+header { text-align: left; margin-bottom: 20px; padding: 0 5px; }
+header h1 { font-size: 2rem; font-weight: 700; margin: 0; color: var(--blue) }
+
+.tabs { border-bottom: 1px solid var(--border-color); margin-bottom: 20px; }
+.tab-button { background: none; border: none; color: var(--text-muted); font-size: 1rem; font-weight: 500; padding: 10px 20px; cursor: pointer; border-bottom: 2px solid transparent; transition: color 0.2s, border-color 0.2s; }
+.tab-button:hover { color: var(--text-primary); }
+.tab-button.active { color: var(--blue); border-bottom-color: var(--blue); }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+.dashboard { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 15px; margin-bottom: 30px; }
+.card { background-color: var(--bg-card); border-radius: 8px; padding: 15px 20px; text-align: left; border: 1px solid var(--border-color); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2); }
+.card-title { font-size: 0.9rem; font-weight: 500; color: var(--text-muted); margin-bottom: 8px; }
+.card-value { font-size: 2rem; font-weight: 700; line-height: 1.2; }
+.card-subtitle { font-size: 0.8rem; color: var(--text-muted); margin-top: 5px; }
+#current-price { font-size: 2.5rem; transition: color 0.3s ease; }
+
+.zones-container-wrapper { background-color: var(--bg-card); border-radius: 8px; padding: 20px; border: 1px solid var(--border-color); }
+.zones-container-wrapper h2 { margin-top: 0; text-align: left; color: var(--text-muted); font-size: 1.2rem; padding-bottom: 10px; border-bottom: 1px solid var(--border-color); }
+#zones-container { display: grid; grid-template-columns: 1fr; gap: 15px; }
+
+.zone-card {
+    background-color: var(--bg-zone-card);
+    border-left: 4px solid var(--border-color);
+    border-radius: 6px;
+    padding: 20px;
+    transition: background-color 0.2s ease;
+}
+.zone-card:hover { background-color: #2d0056; }
+
+.zone-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    padding-bottom: 15px;
+    margin-bottom: 15px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.metric-group {
+    display: flex;
+    flex-direction: column;
+}
+
+.score-group {
+    text-align: right;
+}
+
+.zone-metric-value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    line-height: 1.1;
+}
+
+.zone-metric-label {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-top: 5px;
+}
+
+.zone-card-body ul {
+    list-style: none;
+    padding-left: 0;
+    margin: 0;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    line-height: 1.7;
+}
+
+.zone-card-body li::before {
+    content: "•";
+    color: var(--blue);
+    margin-right: 8px;
+    font-weight: bold;
+}
+
+.confirmation-line {
+    margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid var(--border-color);
+    font-size: 0.9rem;
+    font-weight: bold;
+    color: var(--gold);
+}
+
+.help-section { padding: 10px; background-color: var(--bg-card); border-radius: 8px; }
+.help-section h2 { font-size: 1.5rem; color: var(--blue); border-bottom: 1px solid var(--border-color); padding-bottom: 10px; margin-top: 30px;}
+.help-section h3 { font-size: 1.1rem; color: var(--text-primary); margin-top: 20px; }
+.help-section p { line-height: 1.6; color: var(--text-muted); }
+
+footer { text-align: left; margin-top: 20px; font-size: 0.8rem; color: var(--text-muted); padding: 0 5px; }
+.text-green { color: var(--green); }
+.text-red { color: var(--red); }
