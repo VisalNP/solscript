@@ -15,15 +15,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- CONFIGURATION ---
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 if not BINANCE_API_KEY or not BINANCE_API_SECRET:
     print("FATAL ERROR: Binance API Key/Secret not found.")
-    print("Please create a .env file in the same directory as app.py and add your keys:")
-    print("BINANCE_API_KEY=\"your_key_here\"")
-    print("BINANCE_API_SECRET=\"your_secret_here\"")
     exit() 
+
+# --- NEW: Configuration for Scalper View ---
+SCALPER_VIEW_RANGE_PERCENT = 0.03 # e.g., 0.03 = show levels within +/- 3% of the current price
 
 SYMBOL = 'SOL/USDT'
 TIMEFRAMES = ['1d', '1h', '15m', '5m']
@@ -40,6 +41,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 
 app = Flask(__name__)
 
+#<editor-fold desc=" --- Analysis Logic (Unchanged) --- ">
 exchange = ccxt.binance({'apiKey': BINANCE_API_KEY, 'secret': BINANCE_API_SECRET})
 
 def send_notification(title, message):
@@ -126,6 +128,7 @@ def find_confluence_zones(all_levels):
             avg_price = np.mean([l['price'] for l in zone]); score = sum(l.get('weight', 1) for l in zone); sources = [l['source'] for l in zone]
             potential_entries.append({'price': avg_price, 'score': int(score), 'sources': sources, 'confirmations': []})
     potential_entries.sort(key=lambda x: x['score'], reverse=True); return potential_entries
+#</editor-fold>
 
 def analysis_worker(window):
     print("Analysis worker started.")
@@ -167,7 +170,8 @@ def analysis_worker(window):
                 for fib in [0.236, 0.382, 0.500, 0.618, 0.786]:
                     col_name = f'fib_{fib:.3f}';
                     if col_name in last_row and pd.notna(last_row[col_name]): master_levels.append({'price': last_row[col_name], 'source': f'{tf} Fib {fib:.3f}', 'weight': tf_weight_map[tf]})
-            entries = find_confluence_zones(master_levels)
+            
+            all_entries = find_confluence_zones(master_levels)
             
             current_price = data_frames['5m']['close'].iloc[-1]
             sentiment = analyze_sentiment(data_frames['5m'], data_frames['1h'])
@@ -177,13 +181,27 @@ def analysis_worker(window):
             volatility_text = f"Volatility: {(data_frames['5m']['ATRr_14'].iloc[-1] / current_price) * 100:.2f}%"
 
             df_5m = data_frames['5m']
-            for entry in entries:
+            for entry in all_entries:
                 if abs(current_price - entry['price']) / entry['price'] < ALERT_PROXIMITY_PERCENT:
                     if df_5m['volume'].iloc[-1] > df_5m['Volume_MA_20'].iloc[-1] * VOLUME_SPIKE_FACTOR: entry['confirmations'].append("🔥 Volume Spike")
                     candle_cols = [col for col in df_5m.columns if col.startswith('CDL_')]; last_candle = df_5m[candle_cols].iloc[-1]; found_patterns = last_candle[last_candle != 0]
                     for pattern_name, value in found_patterns.items(): entry['confirmations'].append(f"🕯️ {pattern_name[4:]} ({'Bullish' if value > 0 else 'Bearish'})")
             
-            payload = { "current_price": current_price, "sentiment": sentiment, "potential_entries": entries[:10], "divergence_status": divergence_status, "market_regime": market_regime_text, "volatility": volatility_text, "status": f"Last updated: {datetime.now().strftime('%H:%M:%S')}" }
+            # --- NEW: Filter for Scalper View ---
+            price_upper_bound = current_price * (1 + SCALPER_VIEW_RANGE_PERCENT)
+            price_lower_bound = current_price * (1 - SCALPER_VIEW_RANGE_PERCENT)
+            scalper_entries = [e for e in all_entries if price_lower_bound <= e['price'] <= price_upper_bound]
+
+            payload = { 
+                "current_price": current_price, 
+                "sentiment": sentiment, 
+                "potential_entries": all_entries[:10], # The macro view
+                "scalper_entries": scalper_entries, # The new filtered view
+                "divergence_status": divergence_status, 
+                "market_regime": market_regime_text, 
+                "volatility": volatility_text, 
+                "status": f"Last updated: {datetime.now().strftime('%H:%M:%S')}" 
+            }
             
             if window:
                 window.evaluate_js(f"window.updateData({payload})")
@@ -193,12 +211,13 @@ def analysis_worker(window):
             print(f"An error occurred in the analysis worker: {e}")
         time.sleep(LOOP_INTERVAL_SECONDS)
 
+# --- MODIFIED HTML with new "Scalper View" tab ---
 HTML_CONTENT = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>SOL/USDT Trader Helper</title>
+    <title>Vivi's Trade Helper</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -208,7 +227,8 @@ HTML_CONTENT = f"""
         </header>
 
         <div class="tabs">
-            <button class="tab-button active" onclick="showTab('dashboard')">Dashboard</button>
+            <button class="tab-button active" onclick="showTab('dashboard')">Macro View</button>
+            <button class="tab-button" onclick="showTab('scalper')">Scalper View</button>
             <button class="tab-button" onclick="showTab('help')">Help & Info</button>
         </div>
 
@@ -220,49 +240,40 @@ HTML_CONTENT = f"""
                 <div class="card" id="regime-card"><div class="card-title">Market Regime (1h ADX)</div><div class="card-value" id="market-regime">---</div><div class="card-subtitle" id="volatility">---</div></div>
             </div>
             <div class="zones-container-wrapper">
-                <h2>Top Potential Entry Zones</h2>
+                <h2>Top Potential Entry Zones (Macro)</h2>
                 <div id="zones-container"></div>
+            </div>
+        </div>
+        
+        <div id="scalper-content" class="tab-content">
+             <div class="zones-container-wrapper">
+                <h2>Nearby Entry Zones (+/- {SCALPER_VIEW_RANGE_PERCENT*100:.1f}%)</h2>
+                <div id="scalper-zones-container"></div>
             </div>
         </div>
 
         <div id="help-content" class="tab-content">
             <div class="help-section">
                 <h2>How This Tool Works</h2>
-                <p>This tool continuously analyzes Solana market data across multiple timeframes to find high-probability bounce zones. It identifies areas where multiple technical indicators converge, providing potential entry points for both long and short trades.</p>
+                <p>This tool analyzes market data to find high-probability bounce zones where multiple technical indicators converge.</p>
+                <h2>Views Explained</h2>
+                <h3>Macro View</h3>
+                <p>This tab shows the highest conviction support and resistance zones based on long-term data (up to 90 days). These are major structural levels, but may be far from the current price. Ideal for swing trading or identifying major market turning points.</p>
+                <h3>Scalper View</h3>
+                <p>This tab filters all calculated zones to show only those within a tight range (+/- {SCALPER_VIEW_RANGE_PERCENT*100:.1f}%) of the current price. These are the most immediately actionable levels for short-term scalping and intraday trading.</p>
                 
                 <h2>The Dashboard Explained</h2>
                 <h3>Sentiment</h3>
                 <p>Provides a quick snapshot of the current market sentiment based on a scoring system:<br>
-                    • Price vs 1h 200 EMA: +2 if above, -2 if below (Major Trend).<br>
-                    • Price vs 5m VWAP: +1 if above, -1 if below (Intraday Momentum).<br>
-                    • 5m 21/50 EMA Cross: +1 if 21>50, -1 if 21<50 (Short-term Trend).<br>
-                    A positive score is Bullish, a negative score is Bearish.</p>
+                    • Price vs 1h 200 EMA (+/- 2 pts), Price vs 5m VWAP (+/- 1 pt), 5m 21/50 EMA Cross (+/- 1 pt).</p>
                 <h3>RSI Divergence</h3>
-                <p>This looks for disagreement between price and the RSI indicator, which can be an early warning of a potential reversal.<br>
-                    • Bullish Divergence: Price makes a lower low, but RSI makes a higher low. (Potential bottom)<br>
-                    • Bearish Divergence: Price makes a higher high, but RSI makes a lower high. (Potential top)</p>
+                <p>An early warning of a potential reversal. Bullish: Price makes a lower low, RSI makes a higher low. Bearish: Price makes a higher high, RSI makes a lower high.</p>
                 <h3>Market Regime (1h ADX)</h3>
-                <p>This is one of the most important cards. It tells you the STRENGTH of the 1-hour trend, not its direction.<br>
-                    • RANGING (ADX < {ADX_TREND_THRESHOLD}): The market is choppy or moving sideways. This is IDEAL for bounce trading.<br>
-                    • TRENDING (ADX > {ADX_TREND_THRESHOLD}): The market is in a strong trend. This is DANGEROUS for bounce trading, as levels are more likely to break.</p>
-                <h3>Volatility</h3>
-                <p>This shows the Average True Range (ATR) on the 5-minute chart, as a percentage of price. It indicates the average size of a 5-minute candle. Use this to gauge risk and set your stop-loss distance.</p>
-
-                <h2>Confluence Zones Explained</h2>
+                <p>Measures the STRENGTH of the 1-hour trend.<br>
+                    • RANGING (ADX < {ADX_TREND_THRESHOLD}): Good for bounce trading.<br>
+                    • TRENDING (ADX > {ADX_TREND_THRESHOLD}): Dangerous for bounce trading; levels are more likely to break.</p>
                 <h3>How is the Score Calculated?</h3>
-                <p>The score is a weighted sum of all indicators in a zone. Not all indicators are equal! The hierarchy is:<br>
-                    1. Daily Support/Resistance Zones (15 pts + touches)<br>
-                    2. Hourly Support/Resistance Zones (5 pts + touches)<br>
-                    3. Key Historical Levels (PDL, PWH, etc.): 8 pts<br>
-                    4. Daily Indicators (EMAs, Fibs): 5-7 pts<br>
-                    5. Hourly Indicators (EMAs, VWAP): 2-4 pts<br>
-                    6. 15m/5m Indicators: 0-2 pts<br>
-                    A higher score indicates a more significant level.</p>
-                <h3>Confirmation Signals</h3>
-                <p>When the price gets very close to a high-scoring zone, the script checks for real-time confirmations:<br>
-                    • 🔥 Volume Spike: Volume on the current 5m candle is significantly higher than average.<br>
-                    • 🕯️ Candlestick: A classic reversal pattern (like a Hammer or Engulfing) has formed on the 5m chart.<br>
-                    These confirmations greatly increase the probability of a successful trade.</p>
+                <p>A weighted sum of all indicators in a zone. Higher timeframe and multi-touch S/R zones are weighted much more heavily than low timeframe indicators.</p>
             </div>
         </div>
         
