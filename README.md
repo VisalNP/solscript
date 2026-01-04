@@ -1,10 +1,5 @@
-Here is a comprehensive **README.md** file for your application. You can save this as a file named `README.md` in your project folder.
 
-It explains technical setup, visual indicators, and—most importantly—how to interpret the data for your specific "all-in" trading style.
-
-***
-
-# Vivi's Scalp Terminal (SOL/USDT)
+# Vivi's Trading Terminal (SOL/USDC)
 
 ## Overview
 This application is a specialized trading assistant designed for **5-minute timeframe scalping** on Solana (SOL). Unlike standard charting tools, this terminal calculates mathematical **"Confluence Zones"**—price levels where multiple technical indicators (Moving Averages, Fibonacci, Previous Highs/Lows, and VWAP) overlap.
