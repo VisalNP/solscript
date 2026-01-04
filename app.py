@@ -97,7 +97,9 @@ class MarketAnalyzer:
     def find_sr_zones(self, df, timeframe):
         zones = []
         if df is None: return zones
+        
         order = 5
+        # Convert directly to numpy arrays to avoid indexing errors
         highs_idx = argrelextrema(df['high'].values, np.greater_equal, order=order)[0]
         lows_idx = argrelextrema(df['low'].values, np.less_equal, order=order)[0]
         
@@ -118,10 +120,17 @@ class MarketAnalyzer:
         
         for cluster in clusters:
             if len(cluster) >= 2:
+
+                base_score = Config.WEIGHTS.get(timeframe, 1)
+
+                touch_bonus = min(len(cluster) * 0.2, 5.0)
+                
+                final_weight = base_score + touch_bonus
+                
                 zones.append({
                     'price': float(np.mean(cluster)),
                     'source': f"{timeframe} S/R ({len(cluster)}x)", 
-                    'weight': Config.WEIGHTS.get(timeframe, 1) + len(cluster)
+                    'weight': final_weight
                 })
         return zones
 
