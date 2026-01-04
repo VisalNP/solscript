@@ -1,5 +1,6 @@
 import threading
 import time
+import json
 from datetime import datetime
 import warnings
 import numpy as np
@@ -11,273 +12,322 @@ from plyer import notification
 from flask import Flask, render_template_string
 import webview
 import os 
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv  
 
 load_dotenv()
 
 # --- CONFIGURATION ---
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+class Config:
+    API_KEY = os.getenv("BINANCE_API_KEY")
+    API_SECRET = os.getenv("BINANCE_API_SECRET")
+    SYMBOL = 'SOL/USDT'
+    TIMEFRAMES = ['1d', '1h', '15m', '5m']
+    LOOKBACK_DAYS = 90
+    SCALPER_RANGE = 0.03
+    LOOP_INTERVAL = 60
+    ADX_THRESHOLD = 25
+    WEIGHTS = {'1d': 5, '1h': 3, '15m': 1, '5m': 0.5}
 
-if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-    print("FATAL ERROR: Binance API Key/Secret not found.")
-    exit() 
-
-# --- NEW: Configuration for Scalper View ---
-SCALPER_VIEW_RANGE_PERCENT = 0.03 # e.g., 0.03 = show levels within +/- 3% of the current price
-
-SYMBOL = 'SOL/USDT'
-TIMEFRAMES = ['1d', '1h', '15m', '5m']
-LOOKBACK_DAYS = 90
-CONVERGENCE_PROXIMITY_PERCENT = 0.005
-ALERT_PROXIMITY_PERCENT = 0.005
-LOOP_INTERVAL_SECONDS = 180
-DIVERGENCE_LOOKBACK = 60
-ADX_TREND_THRESHOLD = 25
-VOLUME_SPIKE_FACTOR = 1.75
-
+# Suppress Warnings
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 app = Flask(__name__)
 
-#<editor-fold desc=" --- Analysis Logic (Unchanged) --- ">
-exchange = ccxt.binance({'apiKey': BINANCE_API_KEY, 'secret': BINANCE_API_SECRET})
+# --- HELPER: Fixes the "np is not defined" error ---
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
 
-def send_notification(title, message):
-    try: notification.notify(title=title, message=message, app_name='Crypto Scanner', timeout=30); print("--- NOTIFICATION SENT ---")
-    except Exception as e: print(f"Error sending notification: {e}")
+# --- ANALYSIS ENGINE ---
+class MarketAnalyzer:
+    def __init__(self):
+        self.exchange = ccxt.binance({'apiKey': Config.API_KEY, 'secret': Config.API_SECRET})
+        
+    def fetch_ohlcv(self, timeframe):
+        try:
+            since = self.exchange.parse8601(pd.to_datetime('now', utc=True) - pd.to_timedelta(f'{Config.LOOKBACK_DAYS}d'))
+            ohlcv = self.exchange.fetch_ohlcv(Config.SYMBOL, timeframe=timeframe, since=since)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return timeframe, df
+        except Exception as e:
+            print(f"Error fetching {timeframe}: {e}")
+            return timeframe, None
 
-def fetch_data(symbol, timeframe, lookback_days):
-    try:
-        since = exchange.parse8601(pd.to_datetime('now', utc=True) - pd.to_timedelta(f'{lookback_days}d')); ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms'); df.set_index('timestamp', inplace=True); return df
-    except Exception as e: print(f"Error fetching data for {timeframe}: {e}"); return None
+    def get_all_data(self):
+        data = {}
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(self.fetch_ohlcv, tf) for tf in Config.TIMEFRAMES]
+            for future in futures:
+                tf, df = future.result()
+                if df is not None:
+                    data[tf] = self.calculate_indicators(df)
+        return data
 
-def calculate_indicators(df):
-    if df is None or df.empty: return df
-    df.ta.ema(length=21, append=True); df.ta.ema(length=50, append=True); df.ta.ema(length=99, append=True); df.ta.ema(length=200, append=True)
-    df.ta.rsi(length=14, append=True); df.ta.vwap(append=True)
-    df.ta.adx(append=True); df.ta.atr(append=True)
-    df.ta.cdl_pattern(name="all", append=True, use_talib=False)
-    df['Volume_MA_20'] = df.ta.sma(length=20, close='volume')
-    highest_high = df['high'].max(); lowest_low = df['low'].min(); diff = highest_high - lowest_low
-    df['fib_0.236'] = highest_high - (diff * 0.236); df['fib_0.382'] = highest_high - (diff * 0.382); df['fib_0.500'] = highest_high - (diff * 0.500); df['fib_0.618'] = highest_high - (diff * 0.618); df['fib_0.786'] = highest_high - (diff * 0.786)
-    return df
+    def calculate_indicators(self, df):
+        for length in [21, 50, 99, 200]:
+            df.ta.ema(length=length, append=True)
+        
+        df.ta.rsi(length=14, append=True)
+        df.ta.vwap(append=True)
+        df.ta.adx(append=True)
+        df.ta.atr(append=True)
+        
+        # NOTE: Candle patterns generate the "Requires TA-Lib" spam. 
+        # It is harmless, but if it annoys you, comment out the line below.
+        try:
+            df.ta.cdl_pattern(name="all", append=True, use_talib=False) 
+        except:
+            pass # Skip if it fails
 
-def analyze_sentiment(df_5m, df_1h):
-    sentiment = {'score': 0, 'description': 'Neutral'}
-    if df_5m is None or df_1h is None or df_5m.empty or df_1h.empty: return sentiment
-    current_price = df_5m['close'].iloc[-1]
-    if 'EMA_200' in df_1h.columns and pd.notna(df_1h['EMA_200'].iloc[-1]):
-        if current_price > df_1h['EMA_200'].iloc[-1]: sentiment['score'] += 2
-        else: sentiment['score'] -= 2
-    if 'VWAP_D' in df_5m.columns and pd.notna(df_5m['VWAP_D'].iloc[-1]):
-        if current_price > df_5m['VWAP_D'].iloc[-1]: sentiment['score'] += 1
-        else: sentiment['score'] -= 1
-    if 'EMA_21' in df_5m.columns and 'EMA_50' in df_5m.columns and pd.notna(df_5m['EMA_21'].iloc[-1]) and pd.notna(df_5m['EMA_50'].iloc[-1]):
-        if df_5m['EMA_21'].iloc[-1] > df_5m['EMA_50'].iloc[-1]: sentiment['score'] += 1
-        else: sentiment['score'] -= 1
-    if sentiment['score'] > 1: sentiment['description'] = 'Bullish'
-    elif sentiment['score'] < -1: sentiment['description'] = 'Bearish'
-    return sentiment
+        df['Volume_MA_20'] = df.ta.sma(length=20, close='volume')
+        
+        high, low = df['high'].max(), df['low'].min()
+        diff = high - low
+        for level in [0.236, 0.382, 0.500, 0.618, 0.786]:
+            df[f'fib_{level}'] = high - (diff * level)
+            
+        return df
 
-def detect_rsi_divergence(df, timeframe, lookback):
-    if df is None or len(df) < lookback or 'RSI_14' not in df.columns: return "N/A"
-    df_slice = df.iloc[-lookback:]; order=5 
-    price_highs_idx = argrelextrema(df_slice['high'].values, np.greater, order=order)[0]; price_lows_idx = argrelextrema(df_slice['low'].values, np.less, order=order)[0]
-    rsi_highs_idx = argrelextrema(df_slice['RSI_14'].values, np.greater, order=order)[0]; rsi_lows_idx = argrelextrema(df_slice['RSI_14'].values, np.less, order=order)[0]
-    if len(price_highs_idx) >= 2 and len(rsi_highs_idx) >= 2:
-        if abs(price_highs_idx[-1] - rsi_highs_idx[-1]) < (order + 1):
-            if df_slice['high'].iloc[price_highs_idx[-1]] > df_slice['high'].iloc[price_highs_idx[-2]] and df_slice['RSI_14'].iloc[rsi_highs_idx[-1]] < df_slice['RSI_14'].iloc[rsi_highs_idx[-2]]: return f"Bearish on {timeframe}"
-    if len(price_lows_idx) >= 2 and len(rsi_lows_idx) >= 2:
-        if abs(price_lows_idx[-1] - rsi_lows_idx[-1]) < (order + 1):
-            if df_slice['low'].iloc[price_lows_idx[-1]] < df_slice['low'].iloc[price_lows_idx[-2]] and df_slice['RSI_14'].iloc[rsi_lows_idx[-1]] > df_slice['RSI_14'].iloc[rsi_lows_idx[-2]]: return f"Bullish on {timeframe}"
-    return "None"
+    def find_sr_zones(self, df, timeframe):
+        zones = []
+        if df is None: return zones
+        
+        order = 5
+        # Convert to numpy arrays immediately to avoid index issues
+        highs_idx = argrelextrema(df['high'].values, np.greater_equal, order=order)[0]
+        lows_idx = argrelextrema(df['low'].values, np.less_equal, order=order)[0]
+        
+        levels = np.concatenate((df['high'].iloc[highs_idx].values, df['low'].iloc[lows_idx].values))
+        if len(levels) == 0: return []
+        
+        levels.sort()
+        clusters = []
+        current_cluster = [levels[0]]
+        
+        for i in range(1, len(levels)):
+            if (levels[i] - current_cluster[-1]) / current_cluster[-1] < 0.005:
+                current_cluster.append(levels[i])
+            else:
+                clusters.append(current_cluster)
+                current_cluster = [levels[i]]
+        clusters.append(current_cluster)
+        
+        for cluster in clusters:
+            if len(cluster) >= 2:
+                zones.append({
+                    'price': float(np.mean(cluster)), # FORCE FLOAT
+                    'source': f"{timeframe} S/R ({len(cluster)}x)", 
+                    'weight': Config.WEIGHTS.get(timeframe, 1) + len(cluster)
+                })
+        return zones
 
-def find_sr_zones(df, proximity_percent=0.005, min_touches=2):
-    if df is None or df.empty: return []
-    highs_idx = argrelextrema(df['high'].values, np.greater_equal, order=5)[0]
-    lows_idx = argrelextrema(df['low'].values, np.less_equal, order=5)[0]
-    pivots = np.concatenate((df['high'].iloc[highs_idx].values, df['low'].iloc[lows_idx].values))
-    if len(pivots) == 0: return []
-    pivots = np.sort(pivots)
-    zones = []; current_zone = [pivots[0]]
-    for i in range(1, len(pivots)):
-        if (pivots[i] - current_zone[-1]) / current_zone[-1] < proximity_percent: current_zone.append(pivots[i])
-        else: zones.append(current_zone); current_zone = [pivots[i]]
-    zones.append(current_zone)
-    sr_zones = []
-    for zone in zones:
-        if len(zone) >= min_touches:
-            sr_zones.append({'price': np.mean(zone), 'touches': len(zone)})
-    return sr_zones
+    def detect_divergence(self, df):
+        if df is None or len(df) < 60: return "None"
+        rsi = df['RSI_14'].iloc[-1]
+        if rsi > 70: return "Overbought (>70)"
+        if rsi < 30: return "Oversold (<30)"
+        return "Neutral"
 
-def find_confluence_zones(all_levels):
-    if not all_levels: return []
-    all_levels.sort(key=lambda x: x['price'])
-    confluence_zones = []; current_zone = [all_levels[0]]
-    for i in range(1, len(all_levels)):
-        anchor_price = current_zone[0]['price']
-        if abs(all_levels[i]['price'] - anchor_price) / anchor_price < CONVERGENCE_PROXIMITY_PERCENT: current_zone.append(all_levels[i])
-        else: confluence_zones.append(current_zone); current_zone = [all_levels[i]]
-    confluence_zones.append(current_zone)
-    potential_entries = []
-    for zone in confluence_zones:
-        if len(zone) > 1:
-            avg_price = np.mean([l['price'] for l in zone]); score = sum(l.get('weight', 1) for l in zone); sources = [l['source'] for l in zone]
-            potential_entries.append({'price': avg_price, 'score': int(score), 'sources': sources, 'confirmations': []})
-    potential_entries.sort(key=lambda x: x['score'], reverse=True); return potential_entries
-#</editor-fold>
+    def analyze_sentiment(self, df_5m, df_1h):
+        score = 0
+        current_price = df_5m['close'].iloc[-1]
+        
+        if 'EMA_200' in df_1h.columns:
+            score += 2 if current_price > df_1h['EMA_200'].iloc[-1] else -2
+            
+        if 'VWAP_D' in df_5m.columns:
+            score += 1 if current_price > df_5m['VWAP_D'].iloc[-1] else -1
+            
+        if 'EMA_21' in df_5m.columns and 'EMA_50' in df_5m.columns:
+            if df_5m['EMA_21'].iloc[-1] > df_5m['EMA_50'].iloc[-1]: score += 1
+            else: score -= 1
+        
+        desc = "Neutral"
+        if score >= 2: desc = "Bullish"
+        if score <= -2: desc = "Bearish"
+        
+        return {'score': int(score), 'description': desc}
 
+    def generate_levels(self, data_frames):
+        master_levels = []
+        df_d = data_frames.get('1d')
+        if df_d is not None:
+            prev = df_d.iloc[-2]
+            master_levels.append({'price': float(prev['high']), 'source': 'PDH', 'weight': 8})
+            master_levels.append({'price': float(prev['low']), 'source': 'PDL', 'weight': 8})
+        
+        for tf, df in data_frames.items():
+            if df is None: continue
+            last_row = df.iloc[-1]
+            base_weight = Config.WEIGHTS.get(tf, 1)
+            
+            for ema in [200, 99, 50]:
+                col = f'EMA_{ema}'
+                if col in last_row:
+                    w = base_weight + (2 if ema == 200 else 0)
+                    master_levels.append({'price': float(last_row[col]), 'source': f'{tf} EMA {ema}', 'weight': w})
+            
+            if tf in ['15m', '5m'] and 'VWAP_D' in last_row:
+                master_levels.append({'price': float(last_row['VWAP_D']), 'source': f'{tf} VWAP', 'weight': base_weight + 2})
+                
+            sr = self.find_sr_zones(df, tf)
+            master_levels.extend(sr)
+
+        return master_levels
+
+    def cluster_confluence(self, levels):
+        if not levels: return []
+        levels.sort(key=lambda x: x['price'])
+        
+        clustered = []
+        current = [levels[0]]
+        
+        for i in range(1, len(levels)):
+            if abs(levels[i]['price'] - current[0]['price']) / current[0]['price'] < 0.005:
+                current.append(levels[i])
+            else:
+                clustered.append(current)
+                current = [levels[i]]
+        clustered.append(current)
+        
+        results = []
+        for c in clustered:
+            if len(c) > 1:
+                price = np.mean([x['price'] for x in c])
+                score = sum(x['weight'] for x in c)
+                sources = list(set([x['source'] for x in c]))
+                results.append({
+                    'price': float(price), # FORCE FLOAT
+                    'score': int(score),   # FORCE INT
+                    'sources': sources, 
+                    'confirmations': []
+                })
+        
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results
+
+# --- WORKER THREAD ---
 def analysis_worker(window):
-    print("Analysis worker started.")
+    analyzer = MarketAnalyzer()
+    
     while True:
         try:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Running analysis cycle...")
-            data_frames = {}; all_data_fetched = True
-            for tf in TIMEFRAMES:
-                df = fetch_data(SYMBOL, tf, LOOKBACK_DAYS)
-                if df is not None and not df.empty: data_frames[tf] = calculate_indicators(df)
-                else: all_data_fetched = False; break
-            if not all_data_fetched:
-                print("Fetch failed. Waiting..."); time.sleep(60); continue
-
-            master_levels = []
-            df_daily = data_frames['1d']
-            daily_df_resampled = df_daily.resample('D').agg({'high': 'max', 'low': 'min'})
-            weekly_df_resampled = df_daily.resample('W').agg({'high': 'max', 'low': 'min'})
-            monthly_df_resampled = df_daily.resample('ME').agg({'high': 'max', 'low': 'min'})
-            key_levels_map = {
-                "Prev Day Low (PDL)": daily_df_resampled['low'].iloc[-2] if len(daily_df_resampled) > 1 else None, "Prev Day High (PDH)": daily_df_resampled['high'].iloc[-2] if len(daily_df_resampled) > 1 else None,
-                "Prev Week Low (PWL)": weekly_df_resampled['low'].iloc[-2] if len(weekly_df_resampled) > 1 else None, "Prev Week High (PWH)": weekly_df_resampled['high'].iloc[-2] if len(weekly_df_resampled) > 1 else None,
-                "Prev Month Low (PML)": monthly_df_resampled['low'].iloc[-2] if len(monthly_df_resampled) > 1 else None, "Prev Month High (PMH)": monthly_df_resampled['high'].iloc[-2] if len(monthly_df_resampled) > 1 else None,
-            }
-            for name, price in key_levels_map.items():
-                if price: master_levels.append({'price': price, 'source': name, 'weight': 8})
-            for tf in ['1d', '1h']:
-                sr_zones = find_sr_zones(data_frames[tf])
-                for zone in sr_zones:
-                    weight = (15 if tf == '1d' else 5) + zone['touches']; master_levels.append({'price': zone['price'], 'source': f"{tf} S/R Zone ({zone['touches']} touches)", 'weight': weight})
-            tf_weight_map = {'1d': 5, '1h': 2, '15m': 1, '5m': 0}
-            for tf in TIMEFRAMES:
-                df = data_frames.get(tf); last_row = df.iloc[-1]
-                for ema in [21, 50, 99, 200]:
-                    col_name = f'EMA_{ema}'; weight = tf_weight_map[tf] + (2 if ema in [99,200] and tf in ['1d', '1h'] else 0)
-                    if col_name in last_row and pd.notna(last_row[col_name]): master_levels.append({'price': last_row[col_name], 'source': f'{tf} EMA {ema}', 'weight': weight})
-                if tf != '1d' and 'VWAP_D' in last_row and pd.notna(last_row['VWAP_D']): 
-                    master_levels.append({'price': last_row['VWAP_D'], 'source': f'{tf} VWAP', 'weight': tf_weight_map[tf] + 1})
-                for fib in [0.236, 0.382, 0.500, 0.618, 0.786]:
-                    col_name = f'fib_{fib:.3f}';
-                    if col_name in last_row and pd.notna(last_row[col_name]): master_levels.append({'price': last_row[col_name], 'source': f'{tf} Fib {fib:.3f}', 'weight': tf_weight_map[tf]})
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching data...")
+            data_frames = analyzer.get_all_data()
             
-            all_entries = find_confluence_zones(master_levels)
-            
-            current_price = data_frames['5m']['close'].iloc[-1]
-            sentiment = analyze_sentiment(data_frames['5m'], data_frames['1h'])
-            divergence_status = detect_rsi_divergence(data_frames['5m'], '5m', DIVERGENCE_LOOKBACK)
-            adx_value = data_frames['1h']['ADX_14'].iloc[-1]
-            market_regime_text = f"TRENDING ({adx_value:.1f})" if adx_value > ADX_TREND_THRESHOLD else f"RANGING ({adx_value:.1f})"
-            volatility_text = f"Volatility: {(data_frames['5m']['ATRr_14'].iloc[-1] / current_price) * 100:.2f}%"
+            if not data_frames:
+                time.sleep(10)
+                continue
 
+            current_price = float(data_frames['5m']['close'].iloc[-1])
+            sentiment = analyzer.analyze_sentiment(data_frames['5m'], data_frames['1h'])
+            raw_levels = analyzer.generate_levels(data_frames)
+            zones = analyzer.cluster_confluence(raw_levels)
+            
+            # Simple Confirmation Logic
             df_5m = data_frames['5m']
-            for entry in all_entries:
-                if abs(current_price - entry['price']) / entry['price'] < ALERT_PROXIMITY_PERCENT:
-                    if df_5m['volume'].iloc[-1] > df_5m['Volume_MA_20'].iloc[-1] * VOLUME_SPIKE_FACTOR: entry['confirmations'].append("🔥 Volume Spike")
-                    candle_cols = [col for col in df_5m.columns if col.startswith('CDL_')]; last_candle = df_5m[candle_cols].iloc[-1]; found_patterns = last_candle[last_candle != 0]
-                    for pattern_name, value in found_patterns.items(): entry['confirmations'].append(f"🕯️ {pattern_name[4:]} ({'Bullish' if value > 0 else 'Bearish'})")
+            last_vol = float(df_5m['volume'].iloc[-1])
+            avg_vol = float(df_5m['Volume_MA_20'].iloc[-1])
             
-            # --- NEW: Filter for Scalper View ---
-            price_upper_bound = current_price * (1 + SCALPER_VIEW_RANGE_PERCENT)
-            price_lower_bound = current_price * (1 - SCALPER_VIEW_RANGE_PERCENT)
-            scalper_entries = [e for e in all_entries if price_lower_bound <= e['price'] <= price_upper_bound]
+            for z in zones:
+                if abs(current_price - z['price']) / z['price'] < 0.005:
+                    if last_vol > avg_vol * 1.5:
+                        z['confirmations'].append("High Vol")
 
-            payload = { 
-                "current_price": current_price, 
-                "sentiment": sentiment, 
-                "potential_entries": all_entries[:10], # The macro view
-                "scalper_entries": scalper_entries, # The new filtered view
-                "divergence_status": divergence_status, 
-                "market_regime": market_regime_text, 
-                "volatility": volatility_text, 
-                "status": f"Last updated: {datetime.now().strftime('%H:%M:%S')}" 
+            upper = current_price * (1 + Config.SCALPER_RANGE)
+            lower = current_price * (1 - Config.SCALPER_RANGE)
+            scalper_zones = [z for z in zones if lower <= z['price'] <= upper]
+
+            payload = {
+                "current_price": current_price,
+                "sentiment": sentiment,
+                "potential_entries": zones[:12],
+                "scalper_entries": scalper_zones,
+                "divergence_status": analyzer.detect_divergence(data_frames['5m']),
+                "market_regime": f"ADX: {float(data_frames['1h']['ADX_14'].iloc[-1]):.1f}",
+                "volatility": f"ATR: {float(data_frames['5m']['ATRr_14'].iloc[-1]):.2f}",
+                "status": f"Updated: {datetime.now().strftime('%H:%M:%S')}"
             }
+            
+            # --- CRITICAL FIX: Convert Payload to JSON String using NumpyEncoder ---
+            # This turns np.float64(100.5) into plain 100.5 so JS can understand it
+            json_payload = json.dumps(payload, cls=NumpyEncoder)
             
             if window:
-                window.evaluate_js(f"window.updateData({payload})")
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Update sent to GUI.")
-
+                window.evaluate_js(f"window.updateData({json_payload})")
+                
         except Exception as e:
-            print(f"An error occurred in the analysis worker: {e}")
-        time.sleep(LOOP_INTERVAL_SECONDS)
+            print(f"Loop Error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        time.sleep(Config.LOOP_INTERVAL)
 
-# --- MODIFIED HTML with new "Scalper View" tab ---
-HTML_CONTENT = f"""
+# --- HTML TEMPLATE (Linked to Static Files) ---
+HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Vivi's Trade Helper</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vivi's Scalp Terminal</title>
     <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>Vivi's Trade Helper</h1>
+            <h1>Vivi's Trading Terminal <span style="font-size:0.5em; color:var(--accent-blue)">SOL/USDT</span></h1>
+            <div id="last-updated" class="status-badge">Connecting...</div>
         </header>
 
-        <div class="tabs">
-            <button class="tab-button active" onclick="showTab('dashboard')">Macro View</button>
-            <button class="tab-button" onclick="showTab('scalper')">Scalper View</button>
-            <button class="tab-button" onclick="showTab('help')">Help & Info</button>
+        <div class="dashboard-grid">
+            <div class="metric-card">
+                <span class="metric-label">Price</span>
+                <span class="metric-value" id="current-price">---</span>
+            </div>
+            <div class="metric-card">
+                <span class="metric-label">Sentiment</span>
+                <span class="metric-value" id="sentiment-val">---</span>
+                <span class="metric-sub" id="sentiment-sub">Score: 0</span>
+            </div>
+            <div class="metric-card">
+                <span class="metric-label">Market Regime</span>
+                <span class="metric-value" id="regime-val">---</span>
+                <span class="metric-sub" id="volatility-val">---</span>
+            </div>
+            <div class="metric-card">
+                <span class="metric-label">RSI Status</span>
+                <span class="metric-value" id="divergence-val">---</span>
+            </div>
         </div>
 
-        <div id="dashboard-content" class="tab-content active">
-            <div class="dashboard">
-                <div class="card" id="price-card"><div class="card-title">Current Price</div><div class="card-value" id="current-price">---</div></div>
-                <div class="card" id="sentiment-card"><div class="card-title">Sentiment</div><div class="card-value" id="sentiment">---</div></div>
-                <div class="card" id="divergence-card"><div class="card-title">RSI Divergence</div><div class="card-value" id="divergence">---</div></div>
-                <div class="card" id="regime-card"><div class="card-title">Market Regime (1h ADX)</div><div class="card-value" id="market-regime">---</div><div class="card-subtitle" id="volatility">---</div></div>
-            </div>
-            <div class="zones-container-wrapper">
-                <h2>Top Potential Entry Zones (Macro)</h2>
-                <div id="zones-container"></div>
-            </div>
+        <div class="tabs">
+            <button class="tab-button active" onclick="showTab('scalper')">⚡ Scalper (±3%)</button>
+            <button class="tab-button" onclick="showTab('zones')">🌍 Macro Zones</button>
         </div>
-        
-        <div id="scalper-content" class="tab-content">
-             <div class="zones-container-wrapper">
-                <h2>Nearby Entry Zones (+/- {SCALPER_VIEW_RANGE_PERCENT*100:.1f}%)</h2>
+
+        <div id="scalper-content" class="tab-content active">
+            <div class="zones-wrapper">
                 <div id="scalper-zones-container"></div>
             </div>
         </div>
 
-        <div id="help-content" class="tab-content">
-            <div class="help-section">
-                <h2>How This Tool Works</h2>
-                <p>This tool analyzes market data to find high-probability bounce zones where multiple technical indicators converge.</p>
-                <h2>Views Explained</h2>
-                <h3>Macro View</h3>
-                <p>This tab shows the highest conviction support and resistance zones based on long-term data (up to 90 days). These are major structural levels, but may be far from the current price. Ideal for swing trading or identifying major market turning points.</p>
-                <h3>Scalper View</h3>
-                <p>This tab filters all calculated zones to show only those within a tight range (+/- {SCALPER_VIEW_RANGE_PERCENT*100:.1f}%) of the current price. These are the most immediately actionable levels for short-term scalping and intraday trading.</p>
-                
-                <h2>The Dashboard Explained</h2>
-                <h3>Sentiment</h3>
-                <p>Provides a quick snapshot of the current market sentiment based on a scoring system:<br>
-                    • Price vs 1h 200 EMA (+/- 2 pts), Price vs 5m VWAP (+/- 1 pt), 5m 21/50 EMA Cross (+/- 1 pt).</p>
-                <h3>RSI Divergence</h3>
-                <p>An early warning of a potential reversal. Bullish: Price makes a lower low, RSI makes a higher low. Bearish: Price makes a higher high, RSI makes a lower high.</p>
-                <h3>Market Regime (1h ADX)</h3>
-                <p>Measures the STRENGTH of the 1-hour trend.<br>
-                    • RANGING (ADX < {ADX_TREND_THRESHOLD}): Good for bounce trading.<br>
-                    • TRENDING (ADX > {ADX_TREND_THRESHOLD}): Dangerous for bounce trading; levels are more likely to break.</p>
-                <h3>How is the Score Calculated?</h3>
-                <p>A weighted sum of all indicators in a zone. Higher timeframe and multi-touch S/R zones are weighted much more heavily than low timeframe indicators.</p>
+        <div id="zones-content" class="tab-content">
+            <div class="zones-wrapper">
+                <div id="zones-container"></div>
             </div>
         </div>
-        
-        <footer id="status-footer">Initializing...</footer>
     </div>
     <script src="/static/script.js"></script>
 </body>
@@ -286,19 +336,21 @@ HTML_CONTENT = f"""
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_CONTENT)
+    return render_template_string(HTML)
 
 if __name__ == '__main__':
+    if not Config.API_KEY or not Config.API_SECRET:
+        print("⚠️  WARNING: Binance API Keys not found in .env. Data fetching will fail.")
+
     window = webview.create_window(
-        'Vivi Trade Helper',
+        'Vivi Scalp Terminal',
         app,
-        width=1200,
-        height=800,
-        resizable=True,
-        background_color='#1a1a1d'
+        width=1300,
+        height=900,
+        background_color='#0b0e11'
     )
     
-    analysis_thread = threading.Thread(target=analysis_worker, args=(window,), daemon=True)
-    analysis_thread.start()
+    t = threading.Thread(target=analysis_worker, args=(window,), daemon=True)
+    t.start()
     
     webview.start()

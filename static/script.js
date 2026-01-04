@@ -1,94 +1,111 @@
-// This global function will be called by the Python backend to update data
+let previousPrice = 0;
+
 function updateData(data) {
-    // --- Update Dashboard Cards (Unchanged) ---
-    const priceElem = document.getElementById('current-price');
-    const sentimentElem = document.getElementById('sentiment');
-    const divergenceElem = document.getElementById('divergence');
-    const regimeElem = document.getElementById('market-regime');
-    const volatilityElem = document.getElementById('volatility');
-    const statusFooter = document.getElementById('status-footer');
+    updateDashboard(data);
+    updateZones(data.potential_entries, 'zones-container', data.current_price);
+    updateZones(data.scalper_entries, 'scalper-zones-container', data.current_price);
     
-    let lastPrice = parseFloat(priceElem.dataset.lastPrice) || 0;
-    const currentPrice = data.current_price;
-    priceElem.textContent = `$${currentPrice.toFixed(4)}`;
-    priceElem.className = 'card-value';
-    if (currentPrice > lastPrice) priceElem.classList.add('text-green');
-    else if (currentPrice < lastPrice) priceElem.classList.add('text-red');
-    priceElem.dataset.lastPrice = currentPrice;
-
-    const sentiment = data.sentiment;
-    sentimentElem.innerHTML = `${sentiment.description} <span class="card-subtitle">(${sentiment.score})</span>`;
-    sentimentElem.className = 'card-value';
-    if (sentiment.score > 0) sentimentElem.classList.add('text-green');
-    if (sentiment.score < 0) sentimentElem.classList.add('text-red');
-    
-    const divergence = data.divergence_status;
-    divergenceElem.textContent = divergence;
-    divergenceElem.className = 'card-value';
-    if (divergence.includes('Bullish')) divergenceElem.classList.add('text-green');
-    if (divergence.includes('Bearish')) divergenceElem.classList.add('text-red');
-    
-    const regime = data.market_regime;
-    regimeElem.textContent = regime;
-    regimeElem.className = 'card-value';
-    if (regime.includes('RANGING')) regimeElem.classList.add('text-green');
-    if (regime.includes('TRENDING')) regimeElem.classList.add('text-red');
-    volatilityElem.textContent = data.volatility;
-
-    // --- NEW: A reusable function to create zone cards ---
-    function createZoneCards(entries, containerElement) {
-        containerElement.innerHTML = ''; // Clear previous zones
-        if (entries.length === 0) {
-            containerElement.innerHTML = '<div class="no-zones-message">No zones found in the current range.</div>';
-            return;
-        }
-        
-        entries.forEach(entry => {
-            const isLong = currentPrice > entry.price;
-            const typeClass = isLong ? 'text-green' : 'text-red';
-            const borderColor = isLong ? 'var(--green)' : 'var(--red)';
-            const sources = {'Key Levels': [], 'S/R Zones': [], 'Daily': [], 'Hourly': [], '15m': [], '5m': []};
-            entry.sources.forEach(s => {
-                if (s.includes('S/R Zone')) sources['S/R Zones'].push(s);
-                else if (s.includes('PDL') || s.includes('PDH') || s.includes('PWL') || s.includes('PWH') || s.includes('PML') || s.includes('PMH')) sources['Key Levels'].push(s);
-                else if (s.startsWith('1d')) sources['Daily'].push(s.replace('1d ', ''));
-                else if (s.startsWith('1h')) sources['Hourly'].push(s.replace('1h ', ''));
-                else if (s.startsWith('15m')) sources['15m'].push(s.replace('15m ', ''));
-                else if (s.startsWith('5m')) sources['5m'].push(s.replace('5m ', ''));
-            });
-
-            let sourcesHtml = '<ul>';
-            for (const [category, items] of Object.entries(sources)) {
-                if (items.length > 0) {
-                    sourcesHtml += `<li><strong>${category}:</strong> ${items.join(', ')}</li>`;
-                }
-            }
-            sourcesHtml += '</ul>';
-            let confirmationHtml = '';
-            if (entry.confirmations && entry.confirmations.length > 0) {
-                confirmationHtml = `<div class="confirmation-line">${entry.confirmations.join(' ')}</div>`;
-            }
-
-            const zoneCardHtml = `<div class="zone-card" style="border-left-color: ${borderColor};"><div class="zone-card-header"><div class="metric-group"><div class="zone-metric-value ${typeClass}">$${entry.price.toFixed(4)}</div><div class="zone-metric-label">${isLong ? 'Support Level' : 'Resistance Level'}</div></div><div class="metric-group score-group"><div class="zone-metric-value">${entry.score}</div><div class="zone-metric-label">Confluence Score</div></div></div><div class="zone-card-body">${sourcesHtml}</div>${confirmationHtml}</div>`;
-            containerElement.innerHTML += zoneCardHtml;
-        });
-    }
-
-    // --- Populate Both Tabs ---
-    const macroContainer = document.getElementById('zones-container');
-    const scalperContainer = document.getElementById('scalper-zones-container');
-    
-    createZoneCards(data.potential_entries, macroContainer);
-    createZoneCards(data.scalper_entries, scalperContainer);
-
-    // Update Footer Status
-    statusFooter.textContent = data.status;
+    document.getElementById('last-updated').textContent = data.status;
 }
 
-// Function to handle tab switching (Unchanged)
+function updateDashboard(data) {
+    // --- Price ---
+    const priceElem = document.getElementById('current-price');
+    const price = data.current_price;
+    priceElem.textContent = `$${price.toFixed(4)}`;
+    
+    // Remove old flash classes to restart animation
+    priceElem.classList.remove('flash-green', 'flash-red', 'text-green', 'text-red');
+    
+    // Logic for color & flash
+    if (price > previousPrice) {
+        priceElem.classList.add('flash-green');
+    } else if (price < previousPrice) {
+        priceElem.classList.add('flash-red');
+    } else {
+        // Maintain color state if unchanged, default to white/primary
+        priceElem.style.color = 'var(--text-primary)'; 
+    }
+    previousPrice = price;
+
+    // --- Sentiment ---
+    const sentimentElem = document.getElementById('sentiment-val');
+    const sentimentSub = document.getElementById('sentiment-sub');
+    const sentData = data.sentiment;
+    sentimentElem.textContent = sentData.description;
+    sentimentElem.className = 'metric-value ' + (sentData.score > 0 ? 'text-green' : sentData.score < 0 ? 'text-red' : '');
+    sentimentSub.textContent = `Score: ${sentData.score}`;
+
+    // --- Regime ---
+    document.getElementById('regime-val').textContent = data.market_regime;
+    document.getElementById('volatility-val').textContent = data.volatility;
+
+    // --- Divergence ---
+    const divElem = document.getElementById('divergence-val');
+    divElem.textContent = data.divergence_status;
+    divElem.className = 'metric-value'; // Reset
+    if(data.divergence_status.includes('Bullish')) divElem.classList.add('text-green');
+    if(data.divergence_status.includes('Bearish')) divElem.classList.add('text-red');
+}
+
+function updateZones(entries, containerId, currentPrice) {
+    const container = document.getElementById(containerId);
+    
+    if (entries.length === 0) {
+        container.innerHTML = '<div class="no-zones">Scanning for levels... No high confluence zones nearby.</div>';
+        return;
+    }
+
+    // We rebuild the HTML string. 
+    // Optimization: In a larger app, we would diff the DOM, but for <50 items, innerHTML is fine.
+    let html = '';
+    
+    entries.forEach(entry => {
+        const isLong = currentPrice > entry.price;
+        const colorClass = isLong ? 'text-green' : 'text-red';
+        const borderColor = isLong ? 'var(--accent-green)' : 'var(--accent-red)';
+        const typeLabel = isLong ? 'SUPPORT' : 'RESISTANCE';
+        
+        // Calculate Bar Width (Max score assumed ~25 for visual scaling)
+        const scorePct = Math.min((entry.score / 25) * 100, 100);
+
+        // Group sources
+        const simplifiedSources = entry.sources.map(s => `<span class="zone-source-tag">${s}</span>`).join('');
+        
+        // Confirmations
+        let confirmHtml = '';
+        if (entry.confirmations && entry.confirmations.length > 0) {
+            confirmHtml = `<div class="confirmation-box">${entry.confirmations.join(' • ')}</div>`;
+        }
+
+        html += `
+        <div class="zone-card" style="border-left-color: ${borderColor}">
+            <div class="zone-header">
+                <div>
+                    <div class="zone-price ${colorClass}">$${entry.price.toFixed(4)}</div>
+                    <div class="zone-type" style="color: ${borderColor}">${typeLabel}</div>
+                </div>
+                <div class="confluence-container">
+                    <div class="score-badge">${entry.score}</div>
+                    <div class="score-bar-bg">
+                        <div class="score-bar-fill" style="width: ${scorePct}%; background-color: ${borderColor}"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="zone-details">
+                ${simplifiedSources}
+            </div>
+            ${confirmHtml}
+        </div>`;
+    });
+
+    container.innerHTML = html;
+}
+
 function showTab(tabName) {
-    document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
-    document.querySelectorAll('.tab-button').forEach(button => button.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
+    
     document.getElementById(tabName + '-content').classList.add('active');
-    document.querySelector(`.tab-button[onclick="showTab('${tabName}')"]`).classList.add('active');
+    document.querySelector(`button[onclick="showTab('${tabName}')"]`).classList.add('active');
 }
