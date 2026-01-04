@@ -8,7 +8,6 @@ from scipy.signal import argrelextrema
 import pandas as pd
 import pandas_ta as ta
 import ccxt
-from plyer import notification
 from flask import Flask, render_template_string
 import webview
 import os 
@@ -22,6 +21,7 @@ class Config:
     API_KEY = os.getenv("BINANCE_API_KEY")
     API_SECRET = os.getenv("BINANCE_API_SECRET")
     SYMBOL = 'SOL/USDT'
+    BTC_SYMBOL = 'BTC/USDT'
     TIMEFRAMES = ['1d', '1h', '15m', '5m']
     LOOKBACK_DAYS = 90
     SCALPER_RANGE = 0.03
@@ -29,48 +29,45 @@ class Config:
     ADX_THRESHOLD = 25
     WEIGHTS = {'1d': 5, '1h': 3, '15m': 1, '5m': 0.5}
 
-# Suppress Warnings
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 app = Flask(__name__)
 
-# --- HELPER: Fixes the "np is not defined" error ---
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
+        if isinstance(obj, np.integer): return int(obj)
+        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
         return super(NumpyEncoder, self).default(obj)
 
-# --- ANALYSIS ENGINE ---
 class MarketAnalyzer:
     def __init__(self):
         self.exchange = ccxt.binance({'apiKey': Config.API_KEY, 'secret': Config.API_SECRET})
         
-    def fetch_ohlcv(self, timeframe):
+    def fetch_ohlcv(self, symbol, timeframe):
         try:
             since = self.exchange.parse8601(pd.to_datetime('now', utc=True) - pd.to_timedelta(f'{Config.LOOKBACK_DAYS}d'))
-            ohlcv = self.exchange.fetch_ohlcv(Config.SYMBOL, timeframe=timeframe, since=since)
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-            return timeframe, df
+            return (symbol, timeframe), df
         except Exception as e:
-            print(f"Error fetching {timeframe}: {e}")
-            return timeframe, None
+            print(f"Error fetching {symbol} {timeframe}: {e}")
+            return (symbol, timeframe), None
 
     def get_all_data(self):
         data = {}
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(self.fetch_ohlcv, tf) for tf in Config.TIMEFRAMES]
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(self.fetch_ohlcv, Config.SYMBOL, tf) for tf in Config.TIMEFRAMES]
+            futures.append(executor.submit(self.fetch_ohlcv, Config.BTC_SYMBOL, '5m'))
+            
             for future in futures:
-                tf, df = future.result()
+                (sym, tf), df = future.result()
                 if df is not None:
-                    data[tf] = self.calculate_indicators(df)
+                    key = f"{sym}_{tf}"
+                    data[key] = self.calculate_indicators(df)
         return data
 
     def calculate_indicators(self, df):
@@ -78,16 +75,15 @@ class MarketAnalyzer:
             df.ta.ema(length=length, append=True)
         
         df.ta.rsi(length=14, append=True)
+        df.ta.stochrsi(append=True)
         df.ta.vwap(append=True)
         df.ta.adx(append=True)
         df.ta.atr(append=True)
         
-        # NOTE: Candle patterns generate the "Requires TA-Lib" spam. 
-        # It is harmless, but if it annoys you, comment out the line below.
         try:
             df.ta.cdl_pattern(name="all", append=True, use_talib=False) 
         except:
-            pass # Skip if it fails
+            pass 
 
         df['Volume_MA_20'] = df.ta.sma(length=20, close='volume')
         
@@ -101,9 +97,7 @@ class MarketAnalyzer:
     def find_sr_zones(self, df, timeframe):
         zones = []
         if df is None: return zones
-        
         order = 5
-        # Convert to numpy arrays immediately to avoid index issues
         highs_idx = argrelextrema(df['high'].values, np.greater_equal, order=order)[0]
         lows_idx = argrelextrema(df['low'].values, np.less_equal, order=order)[0]
         
@@ -125,7 +119,7 @@ class MarketAnalyzer:
         for cluster in clusters:
             if len(cluster) >= 2:
                 zones.append({
-                    'price': float(np.mean(cluster)), # FORCE FLOAT
+                    'price': float(np.mean(cluster)),
                     'source': f"{timeframe} S/R ({len(cluster)}x)", 
                     'weight': Config.WEIGHTS.get(timeframe, 1) + len(cluster)
                 })
@@ -141,32 +135,57 @@ class MarketAnalyzer:
     def analyze_sentiment(self, df_5m, df_1h):
         score = 0
         current_price = df_5m['close'].iloc[-1]
-        
         if 'EMA_200' in df_1h.columns:
             score += 2 if current_price > df_1h['EMA_200'].iloc[-1] else -2
-            
         if 'VWAP_D' in df_5m.columns:
             score += 1 if current_price > df_5m['VWAP_D'].iloc[-1] else -1
-            
-        if 'EMA_21' in df_5m.columns and 'EMA_50' in df_5m.columns:
-            if df_5m['EMA_21'].iloc[-1] > df_5m['EMA_50'].iloc[-1]: score += 1
-            else: score -= 1
+        if df_5m['EMA_21'].iloc[-1] > df_5m['EMA_50'].iloc[-1]: score += 1
+        else: score -= 1
         
         desc = "Neutral"
         if score >= 2: desc = "Bullish"
         if score <= -2: desc = "Bearish"
-        
         return {'score': int(score), 'description': desc}
+
+    def analyze_market_context(self, sol_5m, btc_5m):
+        warnings_list = []
+        is_safe = True
+        
+        if btc_5m is not None:
+            btc_open = btc_5m['open'].iloc[-3]
+            btc_close = btc_5m['close'].iloc[-1]
+            btc_change = (btc_close - btc_open) / btc_open
+            
+            if btc_change < -0.005: 
+                warnings_list.append("⚠️ BTC Dumping")
+                is_safe = False
+            elif btc_change > 0.005:
+                warnings_list.append("🚀 BTC Pumping")
+                is_safe = False
+
+        curr_vol = sol_5m['volume'].iloc[-1]
+        avg_vol = sol_5m['Volume_MA_20'].iloc[-1]
+        if curr_vol > avg_vol * 2.0:
+            warnings_list.append("🌊 Volume Surge")
+            is_safe = False
+            
+        adx = sol_5m['ADX_14'].iloc[-1]
+        if adx > 35:
+            warnings_list.append(f"🔥 Strong Trend (ADX {adx:.0f})")
+            is_safe = False
+            
+        return is_safe, warnings_list
 
     def generate_levels(self, data_frames):
         master_levels = []
-        df_d = data_frames.get('1d')
+        df_d = data_frames.get(f"{Config.SYMBOL}_1d")
         if df_d is not None:
             prev = df_d.iloc[-2]
             master_levels.append({'price': float(prev['high']), 'source': 'PDH', 'weight': 8})
             master_levels.append({'price': float(prev['low']), 'source': 'PDL', 'weight': 8})
         
-        for tf, df in data_frames.items():
+        for tf in Config.TIMEFRAMES:
+            df = data_frames.get(f"{Config.SYMBOL}_{tf}")
             if df is None: continue
             last_row = df.iloc[-1]
             base_weight = Config.WEIGHTS.get(tf, 1)
@@ -182,7 +201,6 @@ class MarketAnalyzer:
                 
             sr = self.find_sr_zones(df, tf)
             master_levels.extend(sr)
-
         return master_levels
 
     def cluster_confluence(self, levels):
@@ -207,42 +225,49 @@ class MarketAnalyzer:
                 score = sum(x['weight'] for x in c)
                 sources = list(set([x['source'] for x in c]))
                 results.append({
-                    'price': float(price), # FORCE FLOAT
-                    'score': int(score),   # FORCE INT
+                    'price': float(price),
+                    'score': int(score),
                     'sources': sources, 
-                    'confirmations': []
+                    'confirmations': [],
+                    'warnings': []
                 })
         
         results.sort(key=lambda x: x['score'], reverse=True)
         return results
 
-# --- WORKER THREAD ---
 def analysis_worker(window):
     analyzer = MarketAnalyzer()
-    
     while True:
         try:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching data...")
             data_frames = analyzer.get_all_data()
-            
             if not data_frames:
                 time.sleep(10)
                 continue
 
-            current_price = float(data_frames['5m']['close'].iloc[-1])
-            sentiment = analyzer.analyze_sentiment(data_frames['5m'], data_frames['1h'])
+            sol_5m = data_frames.get(f"{Config.SYMBOL}_5m")
+            btc_5m = data_frames.get(f"{Config.BTC_SYMBOL}_5m")
+            sol_1h = data_frames.get(f"{Config.SYMBOL}_1h")
+
+            if sol_5m is None: continue
+
+            current_price = float(sol_5m['close'].iloc[-1])
+            sentiment = analyzer.analyze_sentiment(sol_5m, sol_1h)
+            is_safe, context_warnings = analyzer.analyze_market_context(sol_5m, btc_5m)
             raw_levels = analyzer.generate_levels(data_frames)
             zones = analyzer.cluster_confluence(raw_levels)
             
-            # Simple Confirmation Logic
-            df_5m = data_frames['5m']
-            last_vol = float(df_5m['volume'].iloc[-1])
-            avg_vol = float(df_5m['Volume_MA_20'].iloc[-1])
-            
             for z in zones:
-                if abs(current_price - z['price']) / z['price'] < 0.005:
-                    if last_vol > avg_vol * 1.5:
-                        z['confirmations'].append("High Vol")
+                if current_price > z['price'] and "⚠️ BTC Dumping" in context_warnings:
+                    z['warnings'].append("BTC Dump Risk")
+                if current_price < z['price'] and "🚀 BTC Pumping" in context_warnings:
+                    z['warnings'].append("BTC Pump Risk")
+                if sol_5m['ADX_14'].iloc[-1] > 35:
+                     z['warnings'].append("High Momentum")
+                     
+                if len(z['warnings']) == 0: z['confidence'] = "High"
+                elif len(z['warnings']) == 1: z['confidence'] = "Medium"
+                else: z['confidence'] = "Low"
 
             upper = current_price * (1 + Config.SCALPER_RANGE)
             lower = current_price * (1 - Config.SCALPER_RANGE)
@@ -251,29 +276,21 @@ def analysis_worker(window):
             payload = {
                 "current_price": current_price,
                 "sentiment": sentiment,
+                "market_warnings": context_warnings,
                 "potential_entries": zones[:12],
                 "scalper_entries": scalper_zones,
-                "divergence_status": analyzer.detect_divergence(data_frames['5m']),
-                "market_regime": f"ADX: {float(data_frames['1h']['ADX_14'].iloc[-1]):.1f}",
-                "volatility": f"ATR: {float(data_frames['5m']['ATRr_14'].iloc[-1]):.2f}",
+                "divergence_status": analyzer.detect_divergence(sol_5m),
+                "market_regime": f"ADX: {float(sol_1h['ADX_14'].iloc[-1]):.1f}",
+                "volatility": f"ATR: {float(sol_5m['ATRr_14'].iloc[-1]):.2f}",
                 "status": f"Updated: {datetime.now().strftime('%H:%M:%S')}"
             }
-            
-            # --- CRITICAL FIX: Convert Payload to JSON String using NumpyEncoder ---
-            # This turns np.float64(100.5) into plain 100.5 so JS can understand it
             json_payload = json.dumps(payload, cls=NumpyEncoder)
-            
             if window:
                 window.evaluate_js(f"window.updateData({json_payload})")
-                
         except Exception as e:
             print(f"Loop Error: {e}")
-            import traceback
-            traceback.print_exc()
-            
         time.sleep(Config.LOOP_INTERVAL)
 
-# --- HTML TEMPLATE (Linked to Static Files) ---
 HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -287,7 +304,7 @@ HTML = """
 <body>
     <div class="container">
         <header>
-            <h1>Vivi's Trading Terminal <span style="font-size:0.5em; color:var(--accent-blue)">SOL/USDT</span></h1>
+            <h1>Vivi's Terminal <span style="font-size:0.5em; color:var(--accent-blue)">SOL/USDT</span></h1>
             <div id="last-updated" class="status-badge">Connecting...</div>
         </header>
 
@@ -340,17 +357,8 @@ def index():
 
 if __name__ == '__main__':
     if not Config.API_KEY or not Config.API_SECRET:
-        print("⚠️  WARNING: Binance API Keys not found in .env. Data fetching will fail.")
-
-    window = webview.create_window(
-        'Vivi Scalp Terminal',
-        app,
-        width=1300,
-        height=900,
-        background_color='#0b0e11'
-    )
-    
+        print("⚠️  WARNING: Binance API Keys not found in .env.")
+    window = webview.create_window('Vivi Scalp Terminal', app, width=1300, height=950, background_color='#0b0e11')
     t = threading.Thread(target=analysis_worker, args=(window,), daemon=True)
     t.start()
-    
     webview.start()
