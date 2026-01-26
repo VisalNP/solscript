@@ -122,3 +122,54 @@ Ignore the level if:
 ### Summary
 *   **Don't trade the "Numbers":** Just because a level exists doesn't mean it will hold.
 *   **Trade the "Context":** Use the badges. If the app says the market context is dangerous, trust it and sit on your hands.
+
+
+## 🚀 Launcher Setup & Taskbar Pinning
+
+Here is the specific guide for setting up the launcher and pinning it to the taskbar.
+
+### 1. Create the Launcher File
+
+1. Open your project folder.
+2. Create a new text file and name it `StartTerminal.bat`.
+3. Right-click it > Edit (or Open with Notepad).
+4. Paste this code:
+
+```bat
+@echo off
+cd /d "%~dp0"
+start "" pythonw app.py
+```
+
+5. Save and close the file.
+
+### 2. Pin to Taskbar (The Trick)
+
+Windows blocks `.bat` files from the taskbar, so we wrap it in a shortcut.
+
+#### Create Shortcut
+Right-click `StartTerminal.bat` → Create shortcut.
+
+#### Edit the Shortcut Properties
+1. Right-click the new shortcut → Properties.
+2. Find the **Target** field. It will look like this:
+   ```
+   "C:\Users\You\Trading\StartTerminal.bat"
+   ```
+3. Add `cmd.exe /c` to the very beginning of that line.
+4. Final Result should look like this (mind the space after `/c`):
+   ```
+   cmd.exe /c "C:\Users\You\Trading\StartTerminal.bat"
+   ```
+
+#### Hide the Pop-up
+In the same window, change the **Run** setting from "Normal window" to **Minimized**.
+This prevents a blank window from flashing when you click it.
+
+#### Change Icon (Optional)
+1. Click **Change Icon...** → OK.
+2. Select an icon you like (or browse to `python.exe` to get the Python logo).
+
+#### Finish
+1. Click **OK**.
+2. Right-click the shortcut → **Pin to taskbar**.
